@@ -2,6 +2,7 @@
 
 use std::{
     f32::consts::{FRAC_PI_2, PI},
+    sync::Arc,
     time::Duration,
 };
 
@@ -23,6 +24,99 @@ use super::{
     smoothing::{InputQueue, Smoothing},
     zoom::ZoomLimits,
 };
+
+/// Provides callbacks for dynamically calculating camera behavior based on world position.
+/// Used with [`OrbitConstraint::Dynamic`].
+///
+/// For floating origin systems, update `world_position` before the camera controller runs
+/// each frame using a system that syncs from your world-space transform component.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// // Planetary camera that transitions between global Y-up and radial up
+/// commands.spawn((
+///     Camera3d::default(),
+///     EditorCam {
+///         orbit_constraint: OrbitConstraint::Dynamic { can_pass_tdc: true },
+///         ..default()
+///     },
+///     DynamicUpCalculator::new(|world_pos| {
+///         let distance = world_pos.length();
+///         const EARTH_RADIUS: f64 = 6_390_000.0;
+///         if distance > EARTH_RADIUS * 3.0 {
+///             Vec3::Y
+///         } else {
+///             world_pos.normalize().as_vec3()
+///         }
+///     })
+///     .with_post_motion(|cam_transform, anchor, up| {
+///         // Custom roll correction logic here
+///     }),
+/// ));
+/// ```
+#[derive(Component, Clone)]
+pub struct DynamicUpCalculator {
+    /// Function that computes the up vector from the camera's world position.
+    pub compute_up: Arc<dyn Fn(DVec3) -> Vec3 + Send + Sync>,
+    /// For floating origin systems, update this before the camera controller runs.
+    /// Falls back to Transform if not set.
+    pub world_position: Option<DVec3>,
+    /// Invoked after all camera motion completes. Useful for custom roll correction.
+    /// Note: v0.5.0 version - no GlobalTransform parameter.
+    pub post_motion: Option<Arc<dyn Fn(&mut Transform, DVec3, Vec3) + Send + Sync>>,
+}
+
+impl DynamicUpCalculator {
+    /// Create a new dynamic up calculator with the given compute function.
+    pub fn new<F>(f: F) -> Self
+    where
+        F: Fn(DVec3) -> Vec3 + Send + Sync + 'static,
+    {
+        Self {
+            compute_up: Arc::new(f),
+            world_position: None,
+            post_motion: None,
+        }
+    }
+
+    /// Add a post-motion callback for custom roll correction after camera motion.
+    #[must_use = "with_post_motion returns a modified DynamicUpCalculator"]
+    pub fn with_post_motion<F>(mut self, f: F) -> Self
+    where
+        F: Fn(&mut Transform, DVec3, Vec3) + Send + Sync + 'static,
+    {
+        self.post_motion = Some(Arc::new(f));
+        self
+    }
+
+    /// Set the world position for floating origin systems.
+    pub fn set_world_position(&mut self, pos: DVec3) {
+        self.world_position = Some(pos);
+    }
+
+    /// Get the current world position, if set.
+    pub fn world_position(&self) -> Option<DVec3> {
+        self.world_position
+    }
+}
+
+impl std::fmt::Debug for DynamicUpCalculator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DynamicUpCalculator")
+            .field("world_position", &self.world_position)
+            .field("compute_up", &"<function>")
+            .field(
+                "post_motion",
+                &if self.post_motion.is_some() {
+                    "Some(<function>)"
+                } else {
+                    "None"
+                },
+            )
+            .finish()
+    }
+}
 
 /// Tracks all state of a camera's controller, including its inputs, motion, and settings.
 ///
@@ -299,18 +393,30 @@ impl EditorCam {
         };
     }
 
-    /// Called once every frame to compute motions and update the transforms of all [`EditorCam`]s
+    /// Update transforms and projections for all cameras. Called once per frame.
     pub fn update_camera_positions(
-        mut cameras: Query<(&mut EditorCam, &Camera, &mut Transform, &mut Projection)>,
+        mut cameras: Query<(
+            &mut EditorCam,
+            &Camera,
+            &mut Transform,
+            &mut Projection,
+            Option<&DynamicUpCalculator>,
+        )>,
         mut event: EventWriter<RequestRedraw>,
         time: Res<Time>,
     ) {
-        for (mut camera_controller, camera, ref mut transform, ref mut projection) in
+        for (mut camera_controller, camera, ref mut transform, ref mut projection, up_calculator) in
             cameras.iter_mut()
         {
             let dt = time.delta();
-            camera_controller
-                .update_transform_and_projection(camera, transform, projection, &mut event, dt);
+            camera_controller.update_transform_and_projection(
+                camera,
+                transform,
+                projection,
+                up_calculator,
+                &mut event,
+                dt,
+            );
         }
     }
 
@@ -320,6 +426,7 @@ impl EditorCam {
         camera: &Camera,
         cam_transform: &mut Transform,
         projection: &mut Projection,
+        up_calculator: Option<&DynamicUpCalculator>,
         redraw: &mut EventWriter<RequestRedraw>,
         delta_time: Duration,
     ) {
@@ -491,55 +598,93 @@ impl EditorCam {
 
         let orbit_multiplier = 0.005;
         if orbit.is_finite() && orbit.length() != 0.0 {
-            match self.orbit_constraint {
-                OrbitConstraint::Fixed { up, can_pass_tdc } => {
-                    let epsilon = 1e-3;
-                    let motion_threshold = 1e-5;
-
-                    let angle_to_bdc = cam_transform.forward().angle_between(up) as f64;
-                    let angle_to_tdc = cam_transform.forward().angle_between(-up) as f64;
-                    let pitch_angle = {
-                        let desired_rotation = orbit.y * orbit_multiplier;
-                        if can_pass_tdc {
-                            desired_rotation
-                        } else if desired_rotation >= 0.0 {
-                            desired_rotation.min(angle_to_tdc - (epsilon as f64).min(angle_to_tdc))
-                        } else {
-                            desired_rotation.max(-angle_to_bdc + (epsilon as f64).min(angle_to_bdc))
-                        }
-                    };
-                    let pitch = if pitch_angle.abs() <= motion_threshold {
-                        DQuat::IDENTITY
+            // Compute up vector from constraint type
+            let (can_pass_tdc, up, is_dynamic) = match self.orbit_constraint {
+                OrbitConstraint::Fixed { up, can_pass_tdc } => (can_pass_tdc, up, false),
+                OrbitConstraint::Dynamic { can_pass_tdc } => {
+                    let up = if let Some(calculator) = up_calculator {
+                        let world_pos = calculator
+                            .world_position
+                            .unwrap_or_else(|| cam_transform.translation.as_dvec3());
+                        (calculator.compute_up)(world_pos)
                     } else {
-                        DQuat::from_axis_angle(cam_transform.left().as_dvec3(), pitch_angle)
+                        warn_once!(
+                            "OrbitConstraint::Dynamic used without DynamicUpCalculator component"
+                        );
+                        Vec3::Y
                     };
-
-                    let yaw_angle = orbit.x * orbit_multiplier;
-                    let yaw = if yaw_angle.abs() <= motion_threshold {
-                        DQuat::IDENTITY
-                    } else {
-                        DQuat::from_axis_angle(up.as_dvec3(), yaw_angle)
-                    };
-
-                    match [pitch == DQuat::IDENTITY, yaw == DQuat::IDENTITY] {
-                        [true, true] => (),
-                        [true, false] => rotate_around(cam_transform, anchor_world, yaw),
-                        [false, true] => rotate_around(cam_transform, anchor_world, pitch),
-                        [false, false] => rotate_around(cam_transform, anchor_world, yaw * pitch),
-                    };
-
-                    let how_upright = cam_transform.up().angle_between(up).abs();
-                    // Orient the camera so up always points up (roll).
-                    if how_upright > epsilon && how_upright < FRAC_PI_2 - epsilon {
-                        cam_transform.look_to(cam_transform.forward(), up);
-                    } else if how_upright > FRAC_PI_2 + epsilon && how_upright < PI - epsilon {
-                        cam_transform.look_to(cam_transform.forward(), -up);
-                    }
+                    (can_pass_tdc, up, true)
                 }
                 OrbitConstraint::Free => {
                     let rotation =
                         DQuat::from_axis_angle(orbit_axis_world, orbit.length() * orbit_multiplier);
                     rotate_around(cam_transform, anchor_world, rotation);
+                    self.last_anchor_depth = anchor.z;
+                    return;
+                }
+            };
+
+            // Orbit logic (shared between Fixed and Dynamic)
+            const GIMBAL_LOCK_EPSILON: f32 = 1e-3;
+            const MOTION_THRESHOLD: f64 = 1e-5;
+
+            let epsilon = GIMBAL_LOCK_EPSILON as f64;
+            let motion_threshold = MOTION_THRESHOLD;
+
+            let angle_to_bdc = cam_transform.forward().angle_between(up) as f64;
+            let angle_to_tdc = cam_transform.forward().angle_between(-up) as f64;
+            let pitch_angle = {
+                let desired_rotation = orbit.y * orbit_multiplier;
+                if can_pass_tdc {
+                    desired_rotation
+                } else if desired_rotation >= 0.0 {
+                    desired_rotation.min(angle_to_tdc - epsilon.min(angle_to_tdc))
+                } else {
+                    desired_rotation.max(-angle_to_bdc + epsilon.min(angle_to_bdc))
+                }
+            };
+            let pitch = if pitch_angle.abs() <= motion_threshold {
+                DQuat::IDENTITY
+            } else {
+                DQuat::from_axis_angle(cam_transform.left().as_dvec3(), pitch_angle)
+            };
+
+            let yaw_angle = orbit.x * orbit_multiplier;
+            let yaw = if yaw_angle.abs() <= motion_threshold {
+                DQuat::IDENTITY
+            } else {
+                DQuat::from_axis_angle(up.as_dvec3(), yaw_angle)
+            };
+
+            match [pitch == DQuat::IDENTITY, yaw == DQuat::IDENTITY] {
+                [true, true] => (),
+                [true, false] => rotate_around(cam_transform, anchor_world, yaw),
+                [false, true] => rotate_around(cam_transform, anchor_world, pitch),
+                [false, false] => rotate_around(cam_transform, anchor_world, yaw * pitch),
+            };
+
+            // Fixed constraints: simple roll correction
+            // Dynamic constraints: defer to post_motion callback for anchor-preserving roll correction
+            if !is_dynamic {
+                let how_upright = cam_transform.up().angle_between(up).abs();
+                let epsilon_f32 = GIMBAL_LOCK_EPSILON;
+                if how_upright > epsilon_f32 && how_upright < FRAC_PI_2 - epsilon_f32 {
+                    cam_transform.look_to(cam_transform.forward(), up);
+                } else if how_upright > FRAC_PI_2 + epsilon_f32 && how_upright < PI - epsilon_f32 {
+                    cam_transform.look_to(cam_transform.forward(), -up);
+                }
+            }
+        }
+
+        // Call post_motion callback if provided (for Dynamic constraint custom corrections)
+        if let OrbitConstraint::Dynamic { .. } = self.orbit_constraint {
+            if let Some(calculator) = up_calculator {
+                if let Some(ref post_motion) = calculator.post_motion {
+                    let world_pos = calculator
+                        .world_position
+                        .unwrap_or_else(|| cam_transform.translation.as_dvec3());
+                    let up = (calculator.compute_up)(world_pos);
+                    post_motion(cam_transform, anchor_world, up);
                 }
             }
         }
@@ -566,18 +711,32 @@ impl EditorCam {
     }
 }
 
-/// Settings that define how camera orbit behaves.
+/// Rotates a transform around a point. 64-bit version of [`Transform::rotate_around`].
+pub fn rotate_around(transform: &mut Transform, point: DVec3, rotation: DQuat) {
+    transform.translation =
+        (point + rotation * (transform.translation.as_dvec3() - point)).as_vec3();
+    transform.rotation = (rotation * transform.rotation.as_dquat())
+        .as_quat()
+        .normalize();
+}
+
+/// Defines how camera orbit behaves with respect to the up direction.
 #[derive(Debug, Clone, Copy, Reflect)]
+#[non_exhaustive]
 pub enum OrbitConstraint {
-    /// The camera's up direction is fixed.
+    /// Fixed up direction
     Fixed {
         /// The camera's up direction must always be parallel with this unit vector.
         up: Vec3,
-        /// Should the camera be allowed to pass over top dead center (TDC), making the camera
-        /// upside down compared to the up direction?
+        /// Can the camera pass over top dead center (become upside down)?
         can_pass_tdc: bool,
     },
-    /// The camera's up direction is free.
+    /// Up vector computed dynamically from camera world position via DynamicUpCalculator
+    Dynamic {
+        /// Can the camera pass over top dead center (become upside down)?
+        can_pass_tdc: bool,
+    },
+    /// Free rotation, no up constraint
     Free,
 }
 
